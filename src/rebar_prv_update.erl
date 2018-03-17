@@ -44,14 +44,16 @@ do(State) ->
             {ok, RegistryDir} ->
                 filelib:ensure_dir(filename:join(RegistryDir, "dummy")),
                 HexFile = filename:join(RegistryDir, "registry"),
+                JSONFile = filename:join(RegistryDir, "registry.json"),
                 ?INFO("Updating package registry...", []),
                 TmpDir = ec_file:insecure_mkdtemp(),
                 TmpFile = filename:join(TmpDir, "packages.gz"),
+                TmpFile2 = filename:join(TmpDir, "packages.json"),
 
                 CDN = rebar_state:get(State, rebar_packages_cdn, ?DEFAULT_CDN),
+                HttpOptions = [{relaxed, true} | rebar_utils:get_proxy_auth()],
                 case rebar_utils:url_append_path(CDN, ?REMOTE_REGISTRY_FILE) of
                     {ok, Url} ->
-                        HttpOptions = [{relaxed, true} | rebar_utils:get_proxy_auth()],
                         ?DEBUG("Fetching registry from ~p", [Url]),
                         case httpc:request(get, {Url, [{"User-Agent", rebar_utils:user_agent()}]},
                                            HttpOptions, [{stream, TmpFile}, {sync, true}],
@@ -61,14 +63,35 @@ do(State) ->
                                 Unzipped = zlib:gunzip(Data),
                                 ok = file:write_file(HexFile, Unzipped),
                                 ?INFO("Writing registry to ~ts", [HexFile]),
-                                hex_to_index(State),
-                                {ok, State};
                             _ ->
                                 ?PRV_ERROR(package_index_download)
                         end;
                     _ ->
                         ?PRV_ERROR({package_parse_cdn, CDN})
                 end;
+                case rebar_utils:url_append_path(CDN, ?REMOTE_JSON_REGISTRY) of
+                    {ok, Url2} ->
+                        ?DEBUG("Fetching JSON registry from ~p", [Url2]),
+                        case httpc:request(get, {Url2, [{"User-Agent", rebar_utils:user_agent()}]},
+                                           HttpOptions, [{stream, TmpFile2}, {sync, true}],
+                                           rebar) of
+                            {ok, saved_to_file} ->
+                                {ok, Data} = file:read_file(TmpFile2),
+                                U = zlib:gunzip(Data),
+                                ok = file:write_file(JSONFile, U),
+                                ?INFO("Writing json registry to ~ts", [JSONFile]),
+                            _ ->
+                                ?DEBUG("No JSON file")
+                        end;
+                    _ ->
+                        ?PRV_ERROR({package_parse_cdn, CDN})
+                end;
+
+                hex_to_index(State),
+                json_to_index(State)
+
+                {ok, State};
+
             {uri_parse_error, CDN} ->
                 ?PRV_ERROR({package_parse_cdn, CDN})
         end
@@ -85,6 +108,43 @@ format_error(package_index_download) ->
     "Failed to download package index.";
 format_error(package_index_write) ->
     "Failed to write package index.".
+
+json_to_index(State) ->
+    {ok, RegistryDir} = rebar_packages:registry_dir(State),
+    Idx = filename:join(RegistryDir, "packages.idx"),
+    JSONFile = filename:join(RegistryDir, "registry.json"),
+    try ets:file2tab(Idx) of
+        {ok, ITbl} ->
+            {ok, D} = file:read_file(JSONFile),
+            %% XXX TODO: Should be a lot more careful about opening this
+            JSON = jsone:decode(D),
+            maps:map(fun(<<"versions">>,
+                         #{ <<"pkg">> := P, <<"versions">> := Vsns } = V) ->
+                             ets:insert(?PACKAGE_TABLE, {P, Vsns}),
+                             V;
+                        (<<"package">>,
+                         #{ <<"name">> := N, <<"version">> := V,
+                            <<"deps">> := D, <<"cksum">> := C } = V0) ->
+                             NewDeps = update_deps_list(N, V, D, ITbl, State),
+                             NewHash = update_deps_hashes(NewDeps),
+                             ets:insert(?PACKAGE_TABLE, {{N, V}, NewHash, C}),
+                             V0;
+                        (K, V1) ->
+                             ?DEBUG("Unexpected key ~p, value ~p", [K,V]),
+                             V1
+                     end,
+                     JSON)
+            ?INFO("Updated ~tp entries from JSON", [map_size(JSON)]),
+            ets:tab2file(?PACKAGE_TABLE, PackageIndex),
+            true;
+        {error, Reason}
+            ?ERROR("Unexpected error loading package.idx", []),
+            false
+    catch
+        C:E ->
+            ?ERROR("~p: ~p", [C:E]),
+            fail
+    end.
 
 is_supported(<<"make">>) -> true;
 is_supported(<<"rebar">>) -> true;
